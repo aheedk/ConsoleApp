@@ -1,60 +1,80 @@
 """
-REST API for Banking System - Customers endpoint
+REST API for Banking System - entry point.
 
-Customer data now comes from MongoDB instead of a hardcoded list.
+This file wires the layers together and starts the server. It holds no routes and
+no logic of its own - that's the point. Everything it does is assembly:
+
+    HTTP -> controllers -> services -> repositories -> database -> MongoDB
+              (this file registers the first one and starts Flask)
+
 Start the database first:  docker compose up -d
 Then put the customers in: python seed.py
+Then run this:             python api.py
 """
 
-from bson import ObjectId
-from bson.errors import InvalidId
 from flask import Flask, jsonify
-from pymongo import MongoClient
 
-app = Flask(__name__)
-
-# Port 27018, not Mongo's usual 27017: this machine already runs another MongoDB
-# on 27017 (the crm-mongodb container). See docker-compose.yml.
-client = MongoClient("mongodb://localhost:27018")
-customers = client.banking.customers
+import database
+from controllers import ERROR_STATUS, customers_blueprint
+from exceptions import AppError
+from repositories import CustomerRepository
 
 
-def to_json(customer):
+def create_app():
     """
-    Turn a Mongo document into what the API hands out.
+    Build the application.
 
-    Mongo's _id is an ObjectId, which jsonify can't serialise - hence str().
-    It's renamed to plain `id` because the underscore is a Mongo detail.
+    A factory rather than a module-level `app = Flask(__name__)` so that creating
+    an app is an explicit act you could do more than once - with different
+    settings, say - instead of a side effect of importing this file.
     """
-    return {
-        "id": str(customer["_id"]),
-        "name": customer["name"],
-        "email": customer["email"],
-        "balance": customer["balance"],
-    }
+    app = Flask(__name__)
+    app.register_blueprint(customers_blueprint)
+    _register_error_handlers(app)
+    return app
 
 
-@app.route('/api/customers', methods=['GET'])
-def get_customers():
-    """Get all customers"""
-    return jsonify([to_json(c) for c in customers.find()])
+def _register_error_handlers(app):
+    """
+    Turn domain exceptions into JSON responses.
 
+    Every failure leaves as {"error": "..."} with a matching status code. This is
+    registered app-wide, which is what lets the controllers simply raise and get
+    on with it - no try/except in a single route.
 
-@app.route('/api/customers/<customer_id>', methods=['GET'])
-def get_customer(customer_id):
-    """Get one customer by id"""
-    try:
-        oid = ObjectId(customer_id)
-    except InvalidId:
-        # Not a real id, e.g. /api/customers/banana. The caller's mistake,
-        # so 400 - without this it would be an unhelpful 500.
-        return jsonify(error=f"'{customer_id}' is not a valid customer id"), 400
+    Flask's own 404 and 405 are HTML pages by default. An HTML body reaching a
+    client that called response.json() surfaces as an unintelligible parse error
+    rather than the clear message we meant to send, so they're overridden too.
+    """
 
-    customer = customers.find_one({"_id": oid})
-    if customer is None:
-        return jsonify(error=f"No customer with id {customer_id}"), 404
-    return jsonify(to_json(customer))
+    @app.errorhandler(AppError)
+    def on_app_error(exc):
+        # isinstance rather than a dict lookup on type(exc), so a subclass of one
+        # of our exceptions would still map correctly.
+        status = next(
+            (code for cls, code in ERROR_STATUS.items() if isinstance(exc, cls)),
+            500,
+        )
+        return jsonify(error=str(exc)), status
+
+    @app.errorhandler(404)
+    def on_not_found(exc):
+        return jsonify(error="Not found"), 404
+
+    @app.errorhandler(405)
+    def on_method_not_allowed(exc):
+        return jsonify(error="Method not allowed for this URL"), 405
 
 
 if __name__ == '__main__':
-    app.run(host='localhost', port=8080, debug=True)
+    # Fail fast and legibly if the database isn't up, rather than discovering it
+    # five seconds into someone's first request. MongoClient is lazy, so without
+    # this the app would start perfectly happily against a database that isn't
+    # there.
+    try:
+        database.ping()
+        CustomerRepository().ensure_indexes()
+    except AppError as exc:
+        raise SystemExit(f"\n{exc}\n\nStart it with:  docker compose up -d\n")
+
+    create_app().run(host='localhost', port=8080, debug=True)
