@@ -1,0 +1,19 @@
+services:
+  mongo:
+    image: mongo:8
+    container_name: banking-mongo
+    ports:
+      # Host port 27018, not 27017. This machine already runs another MongoDB
+      # (the crm-mongodb container) on 27017, and two containers cannot share a
+      # host port. 27018 keeps this project entirely clear of that one.
+      # Left of the colon is the host, right is inside the container - so mongod
+      # still listens on its normal 27017 internally.
+      - "27018:27017"
+    volumes:
+      # Named volume, so data survives `docker compose down` and container
+      # recreation. Without this the database dies with the container.
+      - mongodata:/data/db
+    restart: unless-stopped
+
+volumes:
+  mongodata:
